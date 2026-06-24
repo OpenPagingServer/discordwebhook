@@ -24,7 +24,7 @@ def forms():
     return {
         "webhook": {
             "label": "Discord Webhook",
-            "description": "Send Open Paging Server alerts to a Discord webhook endpoint.",
+            "description": "Send broadcasts to a Discord webhook",
         },
     }
 
