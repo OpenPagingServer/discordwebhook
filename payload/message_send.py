@@ -3,6 +3,7 @@ import json
 import mimetypes
 import os
 import re
+import sqlite3
 import subprocess
 import threading
 import wave
@@ -15,8 +16,9 @@ import requests
 from dotenv import load_dotenv
 
 try:
-    from active_broadcast_store import fetch_active_broadcast
+    from active_broadcast_store import DB_PATH as ACTIVE_BROADCAST_DB_PATH, fetch_active_broadcast
 except Exception:
+    ACTIVE_BROADCAST_DB_PATH = Path("active_broadcasts.sqlite3")
     def fetch_active_broadcast(_msg_id):
         return None
 
@@ -34,6 +36,55 @@ except Exception:
         if "audio" in token and "text" in token:
             return "text+audio"
         return "text"
+
+try:
+    from broadcasts import normalize_sender_context
+except Exception:
+    def normalize_sender_context(sender="", context=None):
+        raw_context = dict(context or {})
+        raw = str(raw_context.get("raw") or raw_context.get("sender") or sender or "").strip()
+        username = ""
+        cnam = ""
+        cid = ""
+        for key in ("username", "sender_username", "user", "user_name"):
+            value = str(raw_context.get(key) or "").strip()
+            if value:
+                username = value
+                break
+        for key in ("cnam", "sender_cnam", "calleridname", "caller_id_name", "callerid_name"):
+            value = str(raw_context.get(key) or "").strip()
+            if value:
+                cnam = value
+                break
+        for key in ("cid", "sender_cid", "calleridnumber", "caller_id_number", "callerid_number"):
+            value = str(raw_context.get(key) or "").strip()
+            if value:
+                cid = value
+                break
+        raw_sender_match = re.match(r"^\s*(.*?)\s*(?:<)?(\+?\d[\d().\-\s]{4,}\d)(?:>)?\s*$", raw)
+        if raw_sender_match:
+            cid = cid or re.sub(r"\s+", " ", raw_sender_match.group(2).strip())
+            guessed_name = raw_sender_match.group(1).strip(" -<>()")
+            if guessed_name:
+                cnam = cnam or guessed_name
+        if not username and raw and not cnam and not cid:
+            username = raw
+        display_parts = []
+        if cnam:
+            display_parts.append(cnam)
+        if cid:
+            display_parts.append(cid)
+        if not display_parts and username:
+            display_parts.append(username)
+        if not display_parts and raw:
+            display_parts.append(raw)
+        return {
+            "raw": raw,
+            "username": username,
+            "cnam": cnam,
+            "cid": cid,
+            "display": " ".join(part for part in display_parts if part).strip(),
+        }
 
 try:
     from endpoints import MODULE_LOG_DIR, connect_endpoint_ipc
@@ -292,10 +343,183 @@ def merge_missing_message_fields(primary, fallback):
     return merged
 
 
+def message_sender_value(message):
+    data = message if isinstance(message, dict) else {}
+    context = normalize_sender_context(
+        sender=str(data.get("sender") or data.get("caller") or "").strip(),
+        context=data,
+    )
+    return str(context.get("display") or context.get("raw") or "").strip()
+
+
+def merge_dispatch_metadata(message, metadata):
+    merged = dict(message or {})
+    data = metadata if isinstance(metadata, dict) else {}
+    for key in (
+        "sender",
+        "caller",
+        "raw",
+        "username",
+        "sender_username",
+        "user",
+        "user_name",
+        "cnam",
+        "sender_cnam",
+        "calleridname",
+        "caller_id_name",
+        "callerid_name",
+        "cid",
+        "sender_cid",
+        "calleridnumber",
+        "caller_id_number",
+        "callerid_number",
+        "issued",
+        "expires",
+        "template_id",
+        "type",
+        "priority",
+        "vendor_specific",
+        "groups",
+        "broadcast_id",
+    ):
+        if merged.get(key) not in (None, ""):
+            continue
+        value = data.get(key)
+        if value not in (None, ""):
+            merged[key] = value
+    return merged
+
+
+def hydrate_messageinfo_fields(message, message_id=None):
+    enriched = dict(message or {})
+    broadcast_id = str(enriched.get("id") or message_id or "").strip()
+    if broadcast_id and not str(enriched.get("id") or "").strip():
+        enriched["id"] = broadcast_id
+    if broadcast_id and broadcast_id != "-1":
+        try:
+            active_message = fetch_active_broadcast(broadcast_id)
+            if active_message:
+                enriched = merge_missing_message_fields(enriched, active_message)
+        except Exception:
+            pass
+    try:
+        broadcast_columns = table_columns("broadcasts")
+        wanted = ["id", "template_id", "sender", "issued", "expires"]
+        selected = [column for column in wanted if column in broadcast_columns]
+        if not selected:
+            return enriched
+        conn = db()
+        try:
+            with conn.cursor() as cur:
+                row = None
+                if broadcast_id and "id" in broadcast_columns:
+                    cur.execute(
+                        f"SELECT {', '.join(f'`{column}`' for column in selected)} "
+                        "FROM `broadcasts` WHERE `id`=%s LIMIT 1",
+                        (broadcast_id,),
+                    )
+                    row = cur.fetchone()
+                if row is None:
+                    match_clauses = []
+                    params = []
+                    name = str(enriched.get("name") or "").strip()
+                    shortmessage = str(enriched.get("shortmessage") or "").strip()
+                    longmessage = str(enriched.get("longmessage") or "").strip()
+                    if name and "name" in broadcast_columns:
+                        match_clauses.append("`name`=%s")
+                        params.append(name)
+                    if shortmessage and "shortmessage" in broadcast_columns:
+                        match_clauses.append("`shortmessage`=%s")
+                        params.append(shortmessage)
+                    if longmessage and "longmessage" in broadcast_columns:
+                        match_clauses.append("`longmessage`=%s")
+                        params.append(longmessage)
+                    if match_clauses:
+                        order_column = "issued" if "issued" in broadcast_columns else ("id" if "id" in broadcast_columns else None)
+                        order_sql = f" ORDER BY `{order_column}` DESC" if order_column else ""
+                        cur.execute(
+                            f"SELECT {', '.join(f'`{column}`' for column in selected)} "
+                            f"FROM `broadcasts` WHERE {' AND '.join(match_clauses)}{order_sql} LIMIT 1",
+                            tuple(params),
+                        )
+                        row = cur.fetchone()
+                if row:
+                    enriched = merge_missing_message_fields(enriched, row)
+        finally:
+            conn.close()
+    except Exception:
+        return enriched
+    if not str(enriched.get("sender") or "").strip():
+        enriched = hydrate_from_active_store_message_match(enriched)
+    return enriched
+
+
+def hydrate_from_active_store_message_match(message):
+    enriched = dict(message or {})
+    db_path = Path(ACTIVE_BROADCAST_DB_PATH)
+    if not db_path.exists():
+        return enriched
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT id, template_id, sender, issued, expires, payload "
+                "FROM active_broadcasts ORDER BY issued DESC LIMIT 100"
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return enriched
+
+    broadcast_id = str(enriched.get("id") or "").strip()
+    template_id = str(enriched.get("template_id") or "").strip()
+    name = str(enriched.get("name") or "").strip()
+    shortmessage = str(enriched.get("shortmessage") or "").strip()
+    longmessage = str(enriched.get("longmessage") or "").strip()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        row_id = str(payload.get("id") or row["id"] or "").strip()
+        row_template_id = str(payload.get("template_id") or row["template_id"] or "").strip()
+        id_matches = bool(broadcast_id and row_id == broadcast_id)
+        template_matches = bool(template_id and row_template_id == template_id)
+        payload_name = str(payload.get("name") or "").strip()
+        payload_shortmessage = str(payload.get("shortmessage") or "").strip()
+        payload_longmessage = str(payload.get("longmessage") or "").strip()
+        content_can_match = bool(name or shortmessage or longmessage)
+        if not id_matches and not template_matches:
+            if not content_can_match:
+                continue
+            if name and payload_name and name != payload_name:
+                continue
+            if shortmessage and payload_shortmessage and shortmessage != payload_shortmessage:
+                continue
+            if longmessage and payload_longmessage and longmessage != payload_longmessage:
+                continue
+        for key in ("id", "template_id", "sender", "issued", "expires"):
+            if str(enriched.get(key) or "").strip():
+                continue
+            if key == "id":
+                value = row["id"]
+            elif key == "template_id":
+                value = row["template_id"] if "template_id" in row.keys() else None
+            else:
+                value = payload.get(key, row[key] if key in row.keys() else None)
+            if value is not None:
+                enriched[key] = value
+        break
+    return enriched
+
+
 def fetch_message(msg_id):
     message_columns = table_columns("messages")
     broadcast_columns = table_columns("broadcasts")
-    message_select = ["name", "shortmessage", "longmessage", "type", "audio", "color", "icon", "expires"]
+    message_select = ["name", "shortmessage", "longmessage", "type", "audio", "color", "icon", "expires", "caller"]
     broadcast_select = [
         "id",
         "name",
@@ -304,6 +528,7 @@ def fetch_message(msg_id):
         "type",
         "audio",
         "sender",
+        "caller",
         "issued",
         "expires",
         "template_id",
@@ -360,6 +585,8 @@ def fetch_message(msg_id):
 def fetch_endpoints_and_message(targets, msg_id):
     endpoints = fetch_configured_endpoints(targets)
     message = fetch_message(msg_id)
+    if message:
+        message = hydrate_messageinfo_fields(message, msg_id)
     debug_log(
         f"fetch_endpoints_and_message targets={targets} "
         f"endpoint_ids={[row.get('id') for row in endpoints]} message_found={bool(message)} "
@@ -655,6 +882,7 @@ def build_delivery_message(action, message, msg_id, metadata=None):
         }
 
     message = message or {}
+    metadata = metadata if isinstance(metadata, dict) else {}
     msg_type = normalize_message_type(message.get("type"))
     bell_message = is_bell_message(message)
     name = str(message.get("name") or "").strip()
@@ -674,9 +902,9 @@ def build_delivery_message(action, message, msg_id, metadata=None):
         "title": title,
         "body": body,
         "type": msg_type,
-        "sender": str(message.get("sender") or "").strip(),
-        "issued": str(message.get("issued") or "").strip(),
-        "expires": str(message.get("expires") or "").strip(),
+        "sender": message_sender_value(message) or message_sender_value(metadata),
+        "issued": str(message.get("issued") or metadata.get("issued") or "").strip(),
+        "expires": str(message.get("expires") or metadata.get("expires") or "").strip(),
         "color": str(message.get("color") or "").strip(),
         "audio": str(message.get("audio") or "").strip(),
         "icon": str(message.get("icon") or "").strip(),
@@ -687,8 +915,9 @@ def build_delivery_message(action, message, msg_id, metadata=None):
 
 def bottom_line_text(delivery):
     parts = []
-    sender = str(delivery.get("sender") or "").strip() or "Unknown"
-    parts.append(f"Sent by {sender}")
+    sender = str(delivery.get("sender") or "").strip()
+    if sender:
+        parts.append(f"Sent by {sender}")
     issued = discord_timestamp(delivery.get("issued"))
     if issued:
         parts.append(f"Issued {issued}")
@@ -1087,6 +1316,13 @@ def handle_dispatch(action, stream_id, msg_id, targets, metadata=None):
         if action == "prepare_audio":
             send_ready_signal(MODULE_NAME, stream_id)
         return
+
+    message = merge_dispatch_metadata(message, metadata)
+    debug_log(
+        f"dispatch_message_sources action={action} msg={msg_id} "
+        f"message_sender={message_sender_value(message)!r} "
+        f"metadata_sender={message_sender_value(metadata)!r}"
+    )
 
     endpoints = eligible_endpoints(endpoints, message)
     msg_type = normalize_message_type(message.get("type"))
